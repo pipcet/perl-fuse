@@ -154,6 +154,77 @@ sub fuse_buf_size {
 	return sum(map { $_->{size} } @$buf);
 }
 
+sub setup {
+	my @names = qw(getattr readlink getdir mknod mkdir unlink rmdir symlink
+			rename link chmod chown truncate utime open read write statfs
+			flush release fsync setxattr getxattr listxattr removexattr
+			opendir readdir releasedir fsyncdir init destroy access
+			create ftruncate fgetattr lock utimens bmap);
+	my $fuse_version = fuse_version();
+	if ($fuse_version >= 2.8) {
+		# junk doesn't contain a function pointer, and hopefully
+		# never will; it's a "dead" zone in the struct
+		# fuse_operations where a flag bit is declared. we don't
+		# need to concern ourselves with it, and it appears any
+		# arch with a 64 bit pointer will align everything to
+		# 8 bytes, making the question of pointer alignment for
+		# the last 2 wrapper functions no big thing.
+		push(@names, qw/junk ioctl poll/);
+	}
+	my @subs = map {undef} @names;
+	my $tmp = 0;
+	my %mapping = map { $_ => $tmp++ } @names;
+	my @otherargs = qw(debug threaded mountpoint mountopts nullpath_ok utimens_as_array);
+	my %otherargs = (
+			  debug			=> 0,
+			  threaded		=> 0,
+			  mountpoint		=> "",
+			  mountopts		=> "",
+			  nullpath_ok		=> 0,
+			  utimens_as_array	=> 0,
+			);
+	while(my $name = shift) {
+		my ($subref) = shift;
+		if(exists($otherargs{$name})) {
+			$otherargs{$name} = $subref;
+		} else {
+			croak "There is no function $name" unless exists($mapping{$name});
+			croak "Usage: Fuse::main(getattr => \"main::my_getattr\", ...)" unless $subref;
+			$subs[$mapping{$name}] = $subref;
+		}
+	}
+	if($otherargs{threaded}) {
+		# make sure threads are both available, and loaded.
+		if($Config{useithreads}) {
+			if(exists($threads::{VERSION})) {
+				if(exists($threads::shared::{VERSION})) {
+					# threads will work.
+				} else {
+					carp("Thread support requires you to use threads::shared.\nThreads are disabled.\n");
+					$otherargs{threaded} = 0;
+				}
+			} else {
+				carp("Thread support requires you to use threads and threads::shared.\nThreads are disabled.\n");
+				$otherargs{threaded} = 0;
+			}
+		} else {
+			carp("Thread support was not compiled into this build of perl.\nThreads are disabled.\n");
+			$otherargs{threaded} = 0;
+		}
+	}
+	return perl_fuse_setup(@otherargs{@otherargs},@subs);
+}
+
+sub process {
+	my $fuse = shift;
+	perl_fuse_process($fuse);
+}
+
+sub shutdown {
+	my $fuse = shift;
+	perl_fuse_shutdown($fuse);
+}
+
 # Autoload methods go after =cut, and are processed by the autosplit program.
 
 1;

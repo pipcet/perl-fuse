@@ -4,6 +4,18 @@
 #include "XSUB.h"
 
 #include <fuse.h>
+#include <fuse/fuse_common.h>
+#include <fuse/fuse_lowlevel.h>
+
+typedef struct fusedata
+{	struct fuse *fuse;
+	char *buf;
+	struct fuse_chan *ch;
+	struct fuse_session *se;
+	char *mountpoint;
+	int bufsize;
+} *  Fusedata;
+extern struct fuse_session *fuse_get_session(struct fuse *f);
 
 #if defined(__linux__) || defined(__APPLE__)
 # include <sys/xattr.h>
@@ -2256,6 +2268,138 @@ perl_fuse_main(...)
 		fuse_loop(fuse_new(fc,&args,&fops,sizeof(fops),NULL));
 	fuse_unmount(mountpoint,fc);
 	fuse_opt_free_args(&args);
+
+void
+perl_fuse_setup(...)
+	PREINIT:
+	struct fuse_operations fops;
+	int i, debug;
+	char *mountpoint;
+	char *mountopts;
+	struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
+	struct fuse *fuse;
+	struct fusedata *fusedata= malloc(sizeof (struct fusedata));
+	struct fuse_chan *fc;
+	dMY_CXT;
+	INIT:
+	if(items != N_CALLBACKS + 6) {
+		fprintf(stderr,"Perl<->C inconsistency or internal error\n");
+		XSRETURN_UNDEF;
+	}
+	memset(&fops, 0, sizeof(struct fuse_operations));
+	PPCODE:
+	debug = SvIV(ST(0));
+	MY_CXT.threaded = SvIV(ST(1));
+	MY_CXT.handles = (HV*)(sv_2mortal((SV*)(newHV())));
+	if(MY_CXT.threaded) {
+#ifdef FUSE_USE_ITHREADS
+		master_interp = aTHX;
+		MUTEX_INIT(&MY_CXT.mutex);
+		SvSHARE((SV*)(MY_CXT.handles));
+#else
+		fprintf(stderr,"FUSE warning: Your script has requested multithreaded "
+		               "mode, but your perl was not built with a supported "
+		               "thread model. Threads are disabled.\n");
+		MY_CXT.threaded = 0;
+#endif
+	}
+	mountpoint = SvPV_nolen(ST(2));
+	mountopts = SvPV_nolen(ST(3));
+#if FUSE_VERSION >= 28
+	fops.flag_nullpath_ok = SvIV(ST(4));
+#endif /* FUSE_VERSION >= 28 */
+	MY_CXT.utimens_as_array = SvIV(ST(5));
+	for(i=0;i<N_CALLBACKS;i++) {
+		SV *var = ST(i+6);
+		/* allow symbolic references, or real code references. */
+		if(SvOK(var) && (SvPOK(var) || (SvROK(var) && SvTYPE(SvRV(var)) == SVt_PVCV))) {
+			void **tmp1 = (void**)&_available_ops, **tmp2 = (void**)&fops;
+			/* Dirty hack, to keep anything from overwriting the
+			 * flag area with a pointer. There should never be
+			 * anything passed as 'junk', but this prevents
+			 * someone from doing it and screwing things up... */
+			if (i == 38)
+				continue;
+			tmp2[i] = tmp1[i];
+			/* it is important to protect these values until shutdown */
+			MY_CXT.callback[i] = SvREFCNT_inc(var);
+		} else if(SvOK(var)) {
+			croak("invalid callback (%i) passed to perl_fuse_main "
+			      "(%s is not a string, code ref, or undef).\n",
+			      i+6,SvPVbyte_nolen(var));
+		} else {
+			MY_CXT.callback[i] = NULL;
+		}
+	}
+	/*
+	 * XXX: What comes here is just a ridiculous use of the option parsing API
+	 * to hack on compatibility with other parts of the new API. First and
+	 * foremost, real C argc/argv would be good to get at...
+	 */
+	if ((mountopts || debug) && fuse_opt_add_arg(&args, "") == -1) {
+		fuse_opt_free_args(&args);
+		croak("out of memory\n");
+	}
+	if (mountopts && strcmp("", mountopts) &&
+	     (fuse_opt_add_arg(&args, "-o") == -1 ||
+	     fuse_opt_add_arg(&args, mountopts) == -1)) {
+		fuse_opt_free_args(&args);
+		croak("out of memory\n");
+	}
+	if (debug && fuse_opt_add_arg(&args, "-d") == -1) {
+		fuse_opt_free_args(&args);
+		croak("out of memory\n");
+	}
+	fc = fuse_mount(mountpoint,&args);
+	if (fc == NULL)
+		croak("could not mount fuse filesystem!\n");
+	fuse = fuse_new(fc,&args,&fops,sizeof(fops),NULL);
+	fuse_opt_free_args(&args);
+//	fusedata = malloc(sizeof (struct fusedata));
+	fusedata->fuse = fuse;
+	fusedata->se = fuse_get_session(fuse);
+	fusedata->ch = fuse_session_next_chan(fusedata->se, NULL);
+	fusedata->bufsize = fuse_chan_bufsize(fusedata->ch);
+	fusedata->buf = malloc(fusedata->bufsize);
+	if(!fusedata->buf)
+		croak("not enough mem");
+	fusedata->mountpoint = strdup(mountpoint);
+//	fprintf(stderr, "fusedata %x perl_fuse_process %x\n", fusedata, &XS_Fuse_perl_fuse_process);
+//	sleep (30);
+	XPUSHs(sv_setref_pv(sv_newmortal(), "Fusedata", fusedata));
+	XPUSHs(sv_2mortal(newSViv(fuse_chan_fd(fc))));
+
+void
+perl_fuse_process(Fusedata fusedata)
+CODE:
+	int res;
+//	fprintf(stderr, "fusedata %x ch %x se %x buf %x\n", fusedata, fusedata->ch, fusedata->se, fusedata->buf);
+	while (!fuse_session_exited(fusedata->se)) {
+		struct fuse_chan *tmpch = fusedata->ch;
+    	res = fuse_chan_recv(&tmpch, fusedata->buf, fusedata->bufsize);
+	    if (res == -EINTR)
+ 	       continue;
+    	if (res <= 0)
+            break;
+        fuse_session_process(fusedata->se, fusedata->buf, res, tmpch);
+        break;
+    }
+
+void
+perl_fuse_shutdown(Fusedata fusedata)
+PREINIT:
+	int i;
+	dMY_CXT;
+CODE:
+	for(i = 0 ; i < N_CALLBACKS ; i++)
+	{	SV *var = MY_CXT.callback[i];
+		if(var)
+			SvREFCNT_dec(var);
+	}
+	free(fusedata->buf);
+	fuse_unmount(fusedata->mountpoint, fusedata->fuse);
+	fuse_destroy(fusedata->fuse);
+	free(fusedata);
 
 #if FUSE_VERSION >= 28
 
