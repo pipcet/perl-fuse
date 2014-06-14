@@ -2375,15 +2375,15 @@ CODE:
 	int res;
 //	fprintf(stderr, "fusedata %x ch %x se %x buf %x\n", fusedata, fusedata->ch, fusedata->se, fusedata->buf);
 	while (!fuse_session_exited(fusedata->se)) {
-		struct fuse_chan *tmpch = fusedata->ch;
-    	res = fuse_chan_recv(&tmpch, fusedata->buf, fusedata->bufsize);
+	    struct fuse_chan *tmpch = fusedata->ch;
+	    res = fuse_chan_recv(&tmpch, fusedata->buf, fusedata->bufsize);
 	    if (res == -EINTR)
- 	       continue;
-    	if (res <= 0)
-            break;
-        fuse_session_process(fusedata->se, fusedata->buf, res, tmpch);
-        break;
-    }
+		continue;
+	    if (res <= 0)
+		break;
+	    fuse_session_process(fusedata->se, fusedata->buf, res, tmpch);
+	    break;
+	}
 
 void
 perl_fuse_shutdown(Fusedata fusedata)
@@ -2391,10 +2391,10 @@ PREINIT:
 	int i;
 	dMY_CXT;
 CODE:
-	for(i = 0 ; i < N_CALLBACKS ; i++)
-	{	SV *var = MY_CXT.callback[i];
-		if(var)
-			SvREFCNT_dec(var);
+	for(i = 0 ; i < N_CALLBACKS ; i++) {
+	    SV *var = MY_CXT.callback[i];
+	    if(var)
+		SvREFCNT_dec(var);
 	}
 	free(fusedata->buf);
 	fuse_unmount(fusedata->mountpoint, fusedata->fuse);
@@ -2409,8 +2409,8 @@ pollhandle_destroy(...)
 	struct fuse_pollhandle *ph;
     INIT:
 	if (items != 1) {
-		fprintf(stderr, "No pollhandle passed?\n");
-		XSRETURN_UNDEF;
+	    fprintf(stderr, "No pollhandle passed?\n");
+	    XSRETURN_UNDEF;
 	}
     CODE:
 	ph = INT2PTR(struct fuse_pollhandle*, SvIV(ST(0)));
@@ -2422,8 +2422,8 @@ notify_poll(...)
 	struct fuse_pollhandle *ph;
     INIT:
 	if (items != 1) {
-		fprintf(stderr, "No pollhandle passed?\n");
-		XSRETURN_UNDEF;
+	    fprintf(stderr, "No pollhandle passed?\n");
+	    XSRETURN_UNDEF;
 	}
     CODE:
 	ph = INT2PTR(struct fuse_pollhandle*, SvIV(ST(0)));
