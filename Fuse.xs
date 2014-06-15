@@ -74,7 +74,20 @@
 #endif
 #define N_FLAGS 8
 
-/* Per-perl thread private data: */
+/* per-Perl-thread per-filesystem data: */
+typedef struct data_thx_fs data_thx_fs;
+struct data_thx_fs {
+	SV *callback[N_CALLBACKS];
+	HV *handles;
+	/* this is a ref to a shared scalar containing our private data */
+	SV *user_private_data;
+
+	data_thx_fs *next_same_fs;
+	data_thx_fs *next_same_thx;
+};
+
+/* The list of THXes to use for the pthreads created by fuselib but
+   not registered with Perl. Per file system.*/
 typedef struct thx_cxt_t thx_cxt_t;
 struct thx_cxt_t {
 	tTHX interp;
@@ -83,7 +96,10 @@ struct thx_cxt_t {
 	thx_cxt_t *next;
 };
 
+/* Per-perl thread private data: */
 typedef struct {
+	data_thx_fs *data_thx_fs;
+
 	SV *callback[N_CALLBACKS];
 	HV *handles;
 	/* this is a ref to a shared scalar containing our private data */
@@ -95,13 +111,21 @@ typedef struct {
 } my_cxt_t;
 START_MY_CXT;
 
-/* Per-pthread private data */
-typedef struct {
-	tTHX self;
+typedef struct fuse_private_data_t fuse_private_data_t;
+
+/* Per-filesystem private data */
+struct fuse_private_data_t {
+	tTHX main_thread;
 	thx_cxt_t **cxt_stackp;
 	perl_mutex cxt_stack_lock;
 	int threaded;
-} fuse_private_data_t;
+
+	data_thx_fs *data_thx_fs;
+	fuse_private_data_t *next;
+};
+
+fuse_private_data_t *fuse_fs_data;
+
 
 #ifdef FUSE_USE_ITHREADS
 perl_mutex master_lock;
