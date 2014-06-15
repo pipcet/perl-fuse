@@ -2310,6 +2310,7 @@ perl_fuse_main(...)
 		MUTEX_INIT(&private_data->cxt_stack_lock);
 		SvSHARE((SV*)(MY_CXT.handles));
 		private_data->threaded = 1;
+		Newxz(private_data->cxt_stackp, sizeof *private_data->cxt_stackp, thx_cxt_t *);
 #else
 		fprintf(stderr,"FUSE warning: Your script has requested multithreaded "
 		               "mode, but your perl was not built with a supported "
