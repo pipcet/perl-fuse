@@ -2066,6 +2066,23 @@ CLONE(...)
 			}
 			MY_CXT.handles = (HV*)SvREFCNT_inc(sv_dup((SV*)MY_CXT.handles, clone_param));
 			MY_CXT.user_private_data = newSVsv(MY_CXT.user_private_data);
+			data_thx_fs *d, **dp;
+			dp = &MY_CXT.data_thx_fs;
+			for (d = *dp; d; d = d->next_same_thx) {
+				data_thx_fs *d2;
+				Newx(d2, sizeof *d2, data_thx_fs);
+				for(i=0;i<N_CALLBACKS;i++) {
+					d2->callback[i] = SvREFCNT_inc(sv_dup(d->callback[i], clone_param));
+				}
+				d2->handles = (HV*)SvREFCNT_inc(sv_dup((SV*)d->handles, clone_param));
+				d2->user_private_data = newSVsv(d->user_private_data);
+				*dp = d2;
+				dp = &d2->next_same_thx;
+
+				d2->next_same_fs = d->next_same_fs;
+				d->next_same_fs = d2->next_same_fs;
+			}
+			*dp = NULL;
 #if (PERL_VERSION > 13) || (PERL_VERSION == 13 && PERL_SUBVERSION >= 2)
 			Perl_clone_params_del(clone_param);
 #endif
