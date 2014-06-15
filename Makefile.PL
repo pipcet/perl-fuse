@@ -75,7 +75,7 @@ unless ($fusever) {
     }
     die("Cannot build for platform: $^O\n", $explanation, "\n");
 }
-if ($fusever && $fusever + 0 < 2.6) {
+if ($fusever && $fusever + 0 < 2.7) {
     die "FUSE API is ", $fusever, ", must be 2.6 or later\n";
 } else {
     warn "fuse version found: ", $fusever, "\n";
