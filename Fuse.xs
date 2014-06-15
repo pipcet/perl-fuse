@@ -1149,29 +1149,20 @@ int _PLfuse_fsyncdir(const char *file, int datasync,
 
 void *_PLfuse_init(struct fuse_conn_info *fc)
 {
-	void *rv = NULL;
-	int prv;
 	FUSE_CONTEXT_PRE;
 	DEBUGf("init begin\n");
 	ENTER;
 	SAVETMPS;
 	PUSHMARK(SP);
 	PUTBACK;
-	prv = call_sv(MY_CXT.callback[29], G_SCALAR);
+	call_sv(MY_CXT.callback[29], G_VOID);
 	SPAGAIN;
-	if (prv) {
-		rv = POPs;
-		if (rv == &PL_sv_undef)
-			rv = NULL;
-		else
-			rv = SvREFCNT_inc((SV *)rv);
-	}
 	FREETMPS;
 	LEAVE;
 	PUTBACK;
-	DEBUGf("init end: %p\n", rv);
 	FUSE_CONTEXT_POST;
-	return rv;
+
+	return NULL;
 }
 
 void _PLfuse_destroy(void *private_data) {
@@ -1186,6 +1177,7 @@ void _PLfuse_destroy(void *private_data) {
 	SPAGAIN;
 	if (private_data)
 		SvREFCNT_dec((SV *)private_data);
+	Safefree(private_data);
 	FREETMPS;
 	LEAVE;
 	PUTBACK;
