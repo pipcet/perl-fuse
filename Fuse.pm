@@ -755,7 +755,8 @@ metadata.
 
 Arguments: None.
 
-Returns (optionally) an SV to be passed as private_data via fuse_get_context().
+Returns (optionally) an SV to be passed as private_data via
+fuse_get_context(). Return value is ignored since version 2.7.
 
 =head3 destroy
 
