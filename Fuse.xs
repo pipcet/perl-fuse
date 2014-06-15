@@ -2397,7 +2397,7 @@ CODE:
 		SvREFCNT_dec(var);
 	}
 	free(fusedata->buf);
-	fuse_unmount(fusedata->mountpoint, fusedata->fuse);
+	fuse_unmount(fusedata->mountpoint, fusedata->ch);
 	fuse_destroy(fusedata->fuse);
 	free(fusedata);
 
