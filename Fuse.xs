@@ -99,7 +99,7 @@ START_MY_CXT;
 typedef struct {
 	tTHX self;
 	thx_cxt_t **cxt_stackp;
-	perl_mutex *cxt_stack_lock;
+	perl_mutex cxt_stack_lock;
 	int threaded;
 } fuse_private_data_t;
 
@@ -115,7 +115,7 @@ tTHX S_clone_interp() {
 	tTHX my_perl = parent;
 #endif
 	dMY_CXT_INTERP(parent);
-	if(MY_CXT.threaded) {
+	if(private_data->threaded) {
 		MUTEX_LOCK(&master_lock);
 		PERL_SET_CONTEXT(parent);
 		dTHX;
@@ -172,21 +172,23 @@ thx_cxt_t *S_find_THX(pTHX_ thx_cxt_t *cxt_stack) {
 
 void S_release_THX() {
 	fuse_private_data_t *private_data = fuse_get_context()->private_data;
+	thx_cxt_t **cxt_stackp = private_data->cxt_stackp;
 
-	if (!private_data.threaded)
+	if (!private_data->threaded)
 		return;
 
-	S_unlock_THX(S_find_THX(aTHX));
+	dTHX;
+	S_unlock_THX(S_find_THX(aTHX_ *cxt_stackp));
 }
 
 void S_acquire_THX() {
 	fuse_private_data_t *private_data = fuse_get_context()->private_data;
 
-	if (!private_data.threaded)
+	if (!private_data->threaded)
 		return;
 	
 	thx_cxt_t **cxt_stackp = private_data->cxt_stackp;
-	perl_mutex cxt_stack_lock = private_data->cxt_stack_lock;
+	perl_mutex *cxt_stack_lock = &private_data->cxt_stack_lock;
 	thx_cxt_t *cxt;
 
 	// try using the active THX if we have one
@@ -209,7 +211,7 @@ void S_acquire_THX() {
 	}
 
 	// otherwise let's create a new THX
-	aTHX = CLONE_INTERP(master_interp);
+	aTHX = CLONE_INTERP();
 	Newx(cxt, sizeof(thx_cxt_t), thx_cxt_t);
 	cxt->interp = aTHX;
 	cxt->active = 1;
@@ -217,10 +219,10 @@ void S_acquire_THX() {
 	cxt->next = NULL;
 
 	// let's put this in the cxt_stack
-	MUTEX_LOCK(&cxt_stack_lock);
+	MUTEX_LOCK(cxt_stack_lock);
 	cxt->next = *cxt_stackp;
 	*cxt_stackp = cxt;
-	MUTEX_UNLOCK(&cxt_stack_lock);
+	MUTEX_UNLOCK(cxt_stack_lock);
 }
 
 
@@ -264,9 +266,11 @@ void S_fh_release_handle(pTHX_ pMY_CXT_ struct fuse_file_info *fi) {
 }
 
 void S_fh_store_handle(pTHX_ pMY_CXT_ struct fuse_file_info *fi, SV *sv) {
+	fuse_private_data_t *private_data = fuse_get_context()->private_data;
+
 	if(SvOK(sv)) {
 #ifdef FUSE_USE_ITHREADS
-		if(threaded) {
+		if(private_data->threaded) {
 			SvSHARE(sv);
 		}
 #endif
@@ -2276,6 +2280,7 @@ perl_fuse_main(...)
 	PREINIT:
 	struct fuse_operations fops;
 	int i, debug;
+	int threaded;
 	char *mountpoint;
 	char *mountopts;
 	struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
@@ -2299,12 +2304,12 @@ perl_fuse_main(...)
 	MY_CXT.handles = (HV*)(sv_2mortal((SV*)(newHV())));
 	MY_CXT.user_private_data = newRV_inc(newSViv(0));
 	//SvSHARE(MY_CXT.user_private_data);
-	if(MY_CXT.threaded) {
+	if(threaded) {
 #ifdef FUSE_USE_ITHREADS
-		MUTEX_INIT(&MY_CXT.mutex);
 		MUTEX_INIT(&master_lock);
-		MUTEX_INIT(&cxt_stack_lock);
+		MUTEX_INIT(&private_data->cxt_stack_lock);
 		SvSHARE((SV*)(MY_CXT.handles));
+		private_data->threaded = 1;
 #else
 		fprintf(stderr,"FUSE warning: Your script has requested multithreaded "
 		               "mode, but your perl was not built with a supported "
@@ -2366,7 +2371,7 @@ perl_fuse_main(...)
 	if (fc == NULL)
 		croak("could not mount fuse filesystem!\n");
 #if !defined(USING_LIBREFUSE) && !defined(__OpenBSD__)
-	if(MY_CXT.threaded) {
+	if(private_data->threaded) {
 		fuse_loop_mt(fuse_new(fc,&args,&fops,sizeof(fops),private_data));
 	} else
 #endif /* !defined(USING_LIBREFUSE) && !defined(__OpenBSD__) */
