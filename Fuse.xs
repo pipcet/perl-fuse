@@ -133,7 +133,7 @@ perl_mutex master_lock;
 #define CLONE_INTERP() S_clone_interp()
 tTHX S_clone_interp() {
 	fuse_private_data_t *private_data = fuse_get_context()->private_data;
-	tTHX parent = private_data->self;
+	tTHX parent = private_data->main_thread;
 #  if (PERL_VERSION < 10)
 	tTHX my_perl = parent;
 #endif
