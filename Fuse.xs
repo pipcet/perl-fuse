@@ -2028,9 +2028,6 @@ PROTOTYPES: DISABLE
 
 BOOT:
 	MY_CXT_INIT;
-#ifdef USE_ITHREADS
-	MY_CXT.self = aTHX;
-#endif
 
 void
 CLONE(...)
