@@ -104,7 +104,6 @@ typedef struct {
 } fuse_private_data_t;
 
 #ifdef FUSE_USE_ITHREADS
-tTHX master_interp = NULL;
 perl_mutex master_lock;
 
 #define CLONE_INTERP() S_clone_interp()
