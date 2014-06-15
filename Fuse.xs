@@ -82,6 +82,8 @@
 typedef struct {
 	SV *callback[N_CALLBACKS];
 	HV *handles;
+	/* this is a ref to a shared scalar containing our private data */
+	SV *user_private_data;
 #ifdef USE_ITHREADS
 	tTHX self;
 #endif
@@ -97,7 +99,6 @@ START_MY_CXT;
 
 typedef struct {
 	tTHX self;
-	SV *user_private_data;
 } fuse_private_data_t;
 
 #ifdef FUSE_USE_ITHREADS
@@ -1157,17 +1158,16 @@ void *_PLfuse_init(struct fuse_conn_info *fc)
 	SPAGAIN;
 	if (prv) {
 		rv = POPs;
-		if (rv == &PL_sv_undef)
-			rv = NULL;
-		else
-			rv = SvREFCNT_inc((SV *)rv);
+		rv = SvREFCNT_inc((SV *)rv);
+		SvSHARE(rv);
+		sv_setsv(SvRV(MY_CXT.user_private_data), rv);
 	}
 	FREETMPS;
 	LEAVE;
 	PUTBACK;
 	DEBUGf("init end: %p\n", rv);
 	FUSE_CONTEXT_POST;
-	return rv;
+	return fuse_get_context()->private_data;
 }
 
 void _PLfuse_destroy(void *private_data) {
@@ -1177,11 +1177,11 @@ void _PLfuse_destroy(void *private_data) {
 	ENTER;
 	SAVETMPS;
 	PUSHMARK(SP);
-	XPUSHs(private->user_private_data);
+	XPUSHs(SvRV(MY_CXT.user_private_data));
 	PUTBACK;
 	call_sv(MY_CXT.callback[30], G_VOID);
 	SPAGAIN;
-	SvREFCNT_dec(private->user_private_data);
+	SvREFCNT_dec(MY_CXT.user_private_data); // XXX
 	Safefree(private);
 	FREETMPS;
 	LEAVE;
@@ -1945,6 +1945,7 @@ CLONE(...)
 				MY_CXT.callback[i] = sv_dup(MY_CXT.callback[i], clone_param);
 			}
 			MY_CXT.handles = (HV*)sv_dup((SV*)MY_CXT.handles, clone_param);
+			MY_CXT.user_private_data = newSVsv(MY_CXT.user_private_data);
 #if (PERL_VERSION > 13) || (PERL_VERSION == 13 && PERL_SUBVERSION >= 2)
 			Perl_clone_params_del(clone_param);
 #endif
@@ -1955,17 +1956,16 @@ SV*
 fuse_get_context()
 	PREINIT:
 	struct fuse_context *fc;
-	fuse_private_data_t *private_data;
 	CODE:
+	FUSE_CONTEXT_PRE;
 	fc = fuse_get_context();
-	private_data = fc->private_data;
 	if(fc) {
 		HV *hash = newHV();
 		(void) hv_store(hash, "uid",   3, newSViv(fc->uid), 0);
 		(void) hv_store(hash, "gid",   3, newSViv(fc->gid), 0);
 		(void) hv_store(hash, "pid",   3, newSViv(fc->pid), 0);
 		if (fc->private_data)
-			(void) hv_store(hash, "private", 7, private_data->user_private_data, 0);
+			(void) hv_store(hash, "private", 7, SvRV(MY_CXT.user_private_data), 0);
 #if FUSE_VERSION >= 28
 		(void) hv_store(hash, "umask", 5, newSViv(fc->umask), 0);
 #endif /* FUSE_VERSION >= 28 */
@@ -1973,6 +1973,7 @@ fuse_get_context()
 	} else {
 		XSRETURN_UNDEF;
 	}
+	FUSE_CONTEXT_POST;
 	OUTPUT:
 	RETVAL
 
@@ -2185,11 +2186,11 @@ perl_fuse_main(...)
 	struct fuse_chan *fc;
 	fuse_private_data_t *private_data;
 	Newx(private_data, 1, fuse_private_data_t);
+	dMY_CXT;
 #ifdef FUSE_USE_ITHREADS
+	MY_CXT.self = aTHX;
 	private_data->self = aTHX;
 #endif
-	private_data->user_private_data = &PL_sv_undef;
-	dMY_CXT;
 	INIT:
 	if(items != N_CALLBACKS + N_FLAGS) {
 		fprintf(stderr,"Perl<->C inconsistency or internal error\n");
@@ -2200,6 +2201,8 @@ perl_fuse_main(...)
 	debug = SvIV(ST(0));
 	MY_CXT.threaded = SvIV(ST(1));
 	MY_CXT.handles = (HV*)(sv_2mortal((SV*)(newHV())));
+	MY_CXT.user_private_data = newRV_inc(newSViv(0));
+	//SvSHARE(MY_CXT.user_private_data);
 	if(MY_CXT.threaded) {
 #ifdef FUSE_USE_ITHREADS
 		MUTEX_INIT(&MY_CXT.mutex);
