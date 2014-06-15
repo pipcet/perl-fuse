@@ -2313,7 +2313,7 @@ perl_fuse_main(...)
 	dMY_CXT;
 #ifdef FUSE_USE_ITHREADS
 	MY_CXT.self = aTHX;
-	private_data->self = aTHX;
+	private_data->main_thread = aTHX;
 #endif
 	INIT:
 	if(items != N_CALLBACKS + N_FLAGS) {
