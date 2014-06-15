@@ -235,7 +235,7 @@ void S_acquire_THX() {
 
 #undef DEBUGf
 #if 0
-#define DEBUGf(f, a...) fprintf(stderr, "%s:%d (%i): " f,__BASE_FILE__,__LINE__,sp-PL_stack_base ,##a )
+#define DEBUGf(f, a...) fprintf(stderr, "%s:%d (%li): " f,__BASE_FILE__,__LINE__,sp-PL_stack_base ,##a )
 #else
 #define DEBUGf(a...)
 #endif
