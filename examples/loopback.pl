@@ -301,7 +301,7 @@ _EOT_
 
 if (! -d $mountpoint) {
     print STDERR "ERROR: attempted to mount to non-directory\n";
-    return -&ENOTDIR
+    exit (1);
 }
 
 daemonize();
