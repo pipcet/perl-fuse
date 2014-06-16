@@ -7,15 +7,10 @@
 #include <fuse/fuse_common.h>
 #include <fuse/fuse_lowlevel.h>
 
-typedef struct fusedata
-{	struct fuse *fuse;
-	char *buf;
-	struct fuse_chan *ch;
-	struct fuse_session *se;
-	char *mountpoint;
-	int bufsize;
-} *  Fusedata;
+struct fusedata;
 extern struct fuse_session *fuse_get_session(struct fuse *f);
+
+typedef struct fuse_chan *Fuse_Channel;
 
 #if defined(__linux__) || defined(__APPLE__)
 # include <sys/xattr.h>
@@ -91,71 +86,76 @@ extern struct fuse_session *fuse_get_session(struct fuse *f);
 #endif
 #define N_FLAGS 8
 
-typedef struct {
+typedef struct fusedata
+{	struct fuse *fuse;
+	struct fuse_chan *ch;
+	struct fuse_session *se;
+	char *mountpoint;
+	int bufsize;
+	struct fuse_operations *fops;
+
+	int threaded;
+	SV *private_data;
 	SV *callback[N_CALLBACKS];
 	HV *handles;
+	int utimens_as_array;
+
+	tTHX creator;
+} *  Fuse_Context;
+
+typedef struct {
 #ifdef USE_ITHREADS
 	tTHX self;
 #endif
-	int threaded;
-#ifdef USE_ITHREADS
-	perl_mutex mutex;
-#endif
-	int utimens_as_array;
+	HV *fuse_contexts;
 } my_cxt_t;
 START_MY_CXT;
 
-#ifdef FUSE_USE_ITHREADS
-tTHX master_interp = NULL;
 
-#define CLONE_INTERP(parent) S_clone_interp(parent)
-tTHX S_clone_interp(tTHX parent) {
-#  if (PERL_VERSION < 10)
-	tTHX my_perl = parent;
-#endif
-	dMY_CXT_INTERP(parent);
-	if(MY_CXT.threaded) {
-		MUTEX_LOCK(&MY_CXT.mutex);
-		PERL_SET_CONTEXT(parent);
-		dTHX;
-#if (PERL_VERSION > 10) || (PERL_VERSION == 10 && PERL_SUBVERSION >= 1)
-		tTHX child = perl_clone(parent, CLONEf_CLONE_HOST | CLONEf_COPY_STACKS);
-#else
-		tTHX child = perl_clone(parent, CLONEf_CLONE_HOST | CLONEf_COPY_STACKS | CLONEf_KEEP_PTR_TABLE);
-		ptr_table_free(PL_ptr_table);
-		PL_ptr_table = NULL;
-#endif
-		MUTEX_UNLOCK(&MY_CXT.mutex);
-		return child;
+Fuse_Context find_fuse_context(pTHX_ pMY_CXT_ const char *in)
+{
+	SV **ret = hv_fetch(MY_CXT.fuse_contexts, in, strlen(in), 0);
+
+	if (!ret) {
+		croak("no context found for %s", in);
 	}
-	return NULL;
+
+	SV *contextsv = *ret;
+	Fuse_Context context;
+	if (sv_derived_from(contextsv, "Fuse::Context")) {
+		IV tmp = SvIV((SV*)SvRV(contextsv));
+		context = INT2PTR(Fuse_Context, tmp);
+	}
+	else
+		croak("context is not of type Fuse::Context");
+
+	if (context->creator != aTHX)
+		croak("context is for the wrong thread!");
+
+	return context;
 }
 
-# define FUSE_CONTEXT_PRE dTHX; if(!aTHX) aTHX = CLONE_INTERP(master_interp); { dMY_CXT; dSP;
-# define FUSE_CONTEXT_POST }
-#else
-# define FUSE_CONTEXT_PRE dTHX; dMY_CXT; dSP;
+# define FUSE_CONTEXT_PRE dTHX; dMY_CXT; Fuse_Context context = find_fuse_context(aTHX_ aMY_CXT_ fuse_get_context()->private_data); PERL_UNUSED_VAR(my_cxtp); dSP;
 # define FUSE_CONTEXT_POST
-#endif
 
 #undef DEBUGf
 #if 0
-#define DEBUGf(f, a...) fprintf(stderr, "%s:%d (%i): " f,__BASE_FILE__,__LINE__,sp-PL_stack_base ,##a )
+#define DEBUGf(f, a...) fprintf(stderr, "%s:%d (%li): " f,__BASE_FILE__,__LINE__,sp-PL_stack_base ,##a )
 #else
 #define DEBUGf(a...)
 #endif
 
-#define FH_KEY(fi) sv_2mortal(newSViv((fi)->fh))
-#define FH_GETHANDLE(fi) S_fh_get_handle(aTHX_ aMY_CXT_ fi)
-#define FH_STOREHANDLE(fi,sv) S_fh_store_handle(aTHX_ aMY_CXT_ fi, sv)
-#define FH_RELEASEHANDLE(fi) S_fh_release_handle(aTHX_ aMY_CXT_ fi)
+#define FH_KEY(context,fi) sv_2mortal(newSViv((fi)->fh))
+#define FH_GETHANDLE(context,fi) S_fh_get_handle(aTHX_ aMY_CXT_ context, fi)
+#define FH_STOREHANDLE(context,fi,sv) S_fh_store_handle(aTHX_ aMY_CXT_ context, fi, sv)
+#define FH_RELEASEHANDLE(context,fi) S_fh_release_handle(aTHX_ aMY_CXT_ context, fi)
 
-SV *S_fh_get_handle(pTHX_ pMY_CXT_ struct fuse_file_info *fi) {
+SV *S_fh_get_handle(pTHX_ pMY_CXT_ Fuse_Context context, struct fuse_file_info *fi) {
 	SV *val;
 	val = &PL_sv_undef;
 	if(fi->fh != 0) {
 		HE *he;
-		if((he = hv_fetch_ent(MY_CXT.handles, FH_KEY(fi), 0, 0))) {
+		if((he = hv_fetch_ent(context->handles, FH_KEY(context,fi), 0, 0))) {
 			val = HeVAL(he);
 			SvGETMAGIC(val);
 		}
@@ -163,17 +163,17 @@ SV *S_fh_get_handle(pTHX_ pMY_CXT_ struct fuse_file_info *fi) {
 	return val;
 }
 
-void S_fh_release_handle(pTHX_ pMY_CXT_ struct fuse_file_info *fi) {
+void S_fh_release_handle(pTHX_ pMY_CXT_ Fuse_Context context, struct fuse_file_info *fi) {
 	if(fi->fh != 0) {
-		(void)hv_delete_ent(MY_CXT.handles, FH_KEY(fi), G_DISCARD, 0);
+		(void)hv_delete_ent(context->handles, FH_KEY(context,fi), G_DISCARD, 0);
 		fi->fh = 0;
 	}
 }
 
-void S_fh_store_handle(pTHX_ pMY_CXT_ struct fuse_file_info *fi, SV *sv) {
+void S_fh_store_handle(pTHX_ pMY_CXT_ Fuse_Context context, struct fuse_file_info *fi, SV *sv) {
 	if(SvOK(sv)) {
 #ifdef FUSE_USE_ITHREADS
-		if(MY_CXT.threaded) {
+		if(context->threaded) {
 			SvSHARE(sv);
 		}
 #endif
@@ -181,7 +181,7 @@ void S_fh_store_handle(pTHX_ pMY_CXT_ struct fuse_file_info *fi, SV *sv) {
 		// MAGIC *mg = (SvTYPE(sv) == SVt_PVMG) ? mg_find(sv, PERL_MAGIC_shared_scalar) : NULL;
 		// fi->fh = mg ? PTR2IV(mg->mg_ptr) : PTR2IV(sv);
 		fi->fh = PTR2IV(sv);
-		if(hv_store_ent(MY_CXT.handles, FH_KEY(fi), SvREFCNT_inc(sv), 0) == NULL) {
+		if(hv_store_ent(context->handles, FH_KEY(context,fi), SvREFCNT_inc(sv), 0) == NULL) {
 			SvREFCNT_dec(sv);
 		}
 		SvSETMAGIC(sv);
@@ -197,7 +197,7 @@ int _PLfuse_getattr(const char *file, struct stat *result) {
 	PUSHMARK(SP);
 	XPUSHs(sv_2mortal(newSVpv(file,strlen(file))));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[0],G_ARRAY);
+	rv = call_sv(context->callback[0],G_ARRAY);
 	SPAGAIN;
 	if(rv != 13) {
 		if(rv > 1) {
@@ -242,7 +242,7 @@ int _PLfuse_readlink(const char *file,char *buf,size_t buflen) {
 	PUSHMARK(SP);
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[1],G_SCALAR);
+	rv = call_sv(context->callback[1],G_SCALAR);
 	SPAGAIN;
 	if(!rv)
 		rv = -ENOENT;
@@ -274,7 +274,7 @@ int _PLfuse_getdir(const char *file, fuse_dirh_t dirh, fuse_dirfil_t dirfil) {
 	PUSHMARK(SP);
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	PUTBACK;
-	prv = call_sv(MY_CXT.callback[2],G_ARRAY);
+	prv = call_sv(context->callback[2],G_ARRAY);
 	SPAGAIN;
 	if(prv) {
 		/* Should yield the bottom of the current stack... */
@@ -309,7 +309,7 @@ int _PLfuse_mknod (const char *file, mode_t mode, dev_t dev) {
 	XPUSHs(sv_2mortal(newSViv(mode)));
 	XPUSHs(sv_2mortal(newSViv(dev)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[3],G_SCALAR);
+	rv = call_sv(context->callback[3],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -330,7 +330,7 @@ int _PLfuse_mkdir (const char *file, mode_t mode) {
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	XPUSHs(sv_2mortal(newSViv(mode)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[4],G_SCALAR);
+	rv = call_sv(context->callback[4],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -350,7 +350,7 @@ int _PLfuse_unlink (const char *file) {
 	PUSHMARK(SP);
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[5],G_SCALAR);
+	rv = call_sv(context->callback[5],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -370,7 +370,7 @@ int _PLfuse_rmdir (const char *file) {
 	PUSHMARK(SP);
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[6],G_SCALAR);
+	rv = call_sv(context->callback[6],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -391,7 +391,7 @@ int _PLfuse_symlink (const char *file, const char *new) {
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	XPUSHs(sv_2mortal(newSVpv(new,0)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[7],G_SCALAR);
+	rv = call_sv(context->callback[7],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -412,7 +412,7 @@ int _PLfuse_rename (const char *file, const char *new) {
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	XPUSHs(sv_2mortal(newSVpv(new,0)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[8],G_SCALAR);
+	rv = call_sv(context->callback[8],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -433,7 +433,7 @@ int _PLfuse_link (const char *file, const char *new) {
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	XPUSHs(sv_2mortal(newSVpv(new,0)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[9],G_SCALAR);
+	rv = call_sv(context->callback[9],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -454,7 +454,7 @@ int _PLfuse_chmod (const char *file, mode_t mode) {
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	XPUSHs(sv_2mortal(newSViv(mode)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[10],G_SCALAR);
+	rv = call_sv(context->callback[10],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -476,7 +476,7 @@ int _PLfuse_chown (const char *file, uid_t uid, gid_t gid) {
 	XPUSHs(sv_2mortal(newSViv(uid)));
 	XPUSHs(sv_2mortal(newSViv(gid)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[11],G_SCALAR);
+	rv = call_sv(context->callback[11],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -507,7 +507,7 @@ int _PLfuse_truncate (const char *file, off_t off) {
 	free(temp);
 #endif
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[12],G_SCALAR);
+	rv = call_sv(context->callback[12],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -529,7 +529,7 @@ int _PLfuse_utime (const char *file, struct utimbuf *uti) {
 	XPUSHs(sv_2mortal(newSViv(uti->actime)));
 	XPUSHs(sv_2mortal(newSViv(uti->modtime)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[13],G_SCALAR);
+	rv = call_sv(context->callback[13],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -566,11 +566,13 @@ int _PLfuse_open (const char *file, struct fuse_file_info *fi) {
 
 	PUTBACK;
 	/* Open called with filename, flags */
-	rv = call_sv(MY_CXT.callback[14],G_ARRAY);
+	rv = call_sv(context->callback[14],G_ARRAY);
 	SPAGAIN;
 	if(rv) {
 		if(rv > 1) {
-			FH_STOREHANDLE(fi,POPs);
+			SV *sv = newSVsv(POPs);
+			SvSHARE(sv);
+			FH_STOREHANDLE(context,fi,sv);
 		}
 		rv = POPi;
 	}
@@ -618,9 +620,9 @@ int _PLfuse_read (const char *file, char *buf, size_t buflen, off_t off,
 	XPUSHs(sv_2mortal(newSVpv(temp, 0)));
 	free(temp);
 #endif
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[15],G_SCALAR);
+	rv = call_sv(context->callback[15],G_SCALAR);
 	SPAGAIN;
 	if(!rv)
 		rv = -ENOENT;
@@ -680,9 +682,9 @@ int _PLfuse_write (const char *file, const char *buf, size_t buflen, off_t off, 
 	XPUSHs(sv_2mortal(newSVpv(temp, 0)));
 	free(temp);
 #endif
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[16],G_SCALAR);
+	rv = call_sv(context->callback[16],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -701,7 +703,7 @@ int _PLfuse_statfs (const char *file, struct statvfs *st) {
 	SAVETMPS;
 	PUSHMARK(SP);
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[17],G_ARRAY);
+	rv = call_sv(context->callback[17],G_ARRAY);
 	SPAGAIN;
 	DEBUGf("statfs got %i params\n",rv);
 	if(rv == 6 || rv == 7) {
@@ -746,9 +748,9 @@ int _PLfuse_flush (const char *file, struct fuse_file_info *fi) {
 	SAVETMPS;
 	PUSHMARK(SP);
 	XPUSHs(file ? sv_2mortal(newSVpv(file,0)) : &PL_sv_undef);
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[18],G_SCALAR);
+	rv = call_sv(context->callback[18],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -772,7 +774,7 @@ int _PLfuse_release (const char *file, struct fuse_file_info *fi) {
 	PUSHMARK(SP);
 	XPUSHs(file ? sv_2mortal(newSVpv(file,0)) : &PL_sv_undef);
 	XPUSHs(sv_2mortal(newSViv(flags)));
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 #if FUSE_VERSION >= 29
 	XPUSHs(fi->flock_release ? sv_2mortal(newSViv(1)) : &PL_sv_undef);
 # ifdef PERL_HAS_64BITINT
@@ -784,10 +786,10 @@ int _PLfuse_release (const char *file, struct fuse_file_info *fi) {
 # endif
 #endif
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[19],G_SCALAR);
+	rv = call_sv(context->callback[19],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
-	FH_RELEASEHANDLE(fi);
+	FH_RELEASEHANDLE(context,fi);
 	FREETMPS;
 	LEAVE;
 	PUTBACK;
@@ -806,9 +808,9 @@ int _PLfuse_fsync (const char *file, int datasync, struct fuse_file_info *fi) {
 	PUSHMARK(SP);
 	XPUSHs(file ? sv_2mortal(newSVpv(file,0)) : &PL_sv_undef);
 	XPUSHs(sv_2mortal(newSViv(flags)));
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[20],G_SCALAR);
+	rv = call_sv(context->callback[20],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -835,7 +837,7 @@ int _PLfuse_setxattr (const char *file, const char *name, const char *buf, size_
 	XPUSHs(sv_2mortal(newSVpvn(buf,buflen)));
 	XPUSHs(sv_2mortal(newSViv(flags)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[21],G_SCALAR);
+	rv = call_sv(context->callback[21],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -860,7 +862,7 @@ int _PLfuse_getxattr (const char *file, const char *name, char *buf, size_t bufl
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	XPUSHs(sv_2mortal(newSVpv(name,0)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[22],G_SCALAR);
+	rv = call_sv(context->callback[22],G_SCALAR);
 	SPAGAIN;
 	if(!rv)
 		rv = -ENOENT;
@@ -902,7 +904,7 @@ int _PLfuse_listxattr (const char *file, char *list, size_t size) {
 	PUSHMARK(SP);
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	PUTBACK;
-	prv = call_sv(MY_CXT.callback[23],G_ARRAY);
+	prv = call_sv(context->callback[23],G_ARRAY);
 	SPAGAIN;
 	if(!prv)
 		rv = -ENOENT;
@@ -967,7 +969,7 @@ int _PLfuse_removexattr (const char *file, const char *name) {
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	XPUSHs(sv_2mortal(newSVpv(name,0)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[24],G_SCALAR);
+	rv = call_sv(context->callback[24],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -988,11 +990,13 @@ int _PLfuse_opendir(const char *file, struct fuse_file_info *fi) {
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	fi->fh = 0; /* Ensure it starts with 0 - important if they don't set it */
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[25], G_ARRAY);
+	rv = call_sv(context->callback[25], G_ARRAY);
 	SPAGAIN;
 	if (rv) {
 		if (rv > 1) {
-			FH_STOREHANDLE(fi, POPs);
+			SV *sv = newSVsv(POPs);
+			SvSHARE(sv);
+			FH_STOREHANDLE(context,fi,sv);
 		}
 		rv = POPi;
 	} else
@@ -1029,9 +1033,9 @@ int _PLfuse_readdir(const char *file, void *dirh, fuse_fill_dir_t dirfil,
 	XPUSHs(sv_2mortal(newSVpv(temp, 0)));
 	free(temp);
 #endif
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	prv = call_sv(MY_CXT.callback[26],G_ARRAY);
+	prv = call_sv(context->callback[26],G_ARRAY);
 	SPAGAIN;
 	if (prv) {
 		/* Should yield the bottom of the current stack... */
@@ -1110,12 +1114,12 @@ int _PLfuse_releasedir(const char *file, struct fuse_file_info *fi) {
 	SAVETMPS;
 	PUSHMARK(SP);
 	XPUSHs(file ? sv_2mortal(newSVpv(file,0)) : &PL_sv_undef);
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[27], G_SCALAR);
+	rv = call_sv(context->callback[27], G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
-	FH_RELEASEHANDLE(fi);
+	FH_RELEASEHANDLE(context,fi);
 	FREETMPS;
 	LEAVE;
 	PUTBACK;
@@ -1134,9 +1138,9 @@ int _PLfuse_fsyncdir(const char *file, int datasync,
 	PUSHMARK(SP);
 	XPUSHs(file ? sv_2mortal(newSVpv(file,0)) : &PL_sv_undef);
 	XPUSHs(sv_2mortal(newSViv(datasync)));
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[28], G_SCALAR);
+	rv = call_sv(context->callback[28], G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -1157,21 +1161,21 @@ void *_PLfuse_init(struct fuse_conn_info *fc)
 	SAVETMPS;
 	PUSHMARK(SP);
 	PUTBACK;
-	prv = call_sv(MY_CXT.callback[29], G_SCALAR);
+	prv = call_sv(context->callback[29], G_SCALAR);
 	SPAGAIN;
 	if (prv) {
 		rv = POPs;
 		if (rv == &PL_sv_undef)
-			rv = NULL;
+			context->private_data = NULL;
 		else
-			rv = SvREFCNT_inc((SV *)rv);
+			context->private_data = SvREFCNT_inc((SV *)rv);
 	}
 	FREETMPS;
 	LEAVE;
 	PUTBACK;
 	DEBUGf("init end: %p\n", rv);
 	FUSE_CONTEXT_POST;
-	return rv;
+	return context;
 }
 
 void _PLfuse_destroy(void *private_data) {
@@ -1180,12 +1184,10 @@ void _PLfuse_destroy(void *private_data) {
 	ENTER;
 	SAVETMPS;
 	PUSHMARK(SP);
-	XPUSHs(private_data ? (SV *)private_data : &PL_sv_undef);
+	XPUSHs(context->private_data ? (SV *)context->private_data : &PL_sv_undef);
 	PUTBACK;
-	call_sv(MY_CXT.callback[30], G_VOID);
+	call_sv(context->callback[30], G_VOID);
 	SPAGAIN;
-	if (private_data)
-		SvREFCNT_dec((SV *)private_data);
 	FREETMPS;
 	LEAVE;
 	PUTBACK;
@@ -1203,7 +1205,7 @@ int _PLfuse_access(const char *file, int mask) {
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
 	XPUSHs(sv_2mortal(newSViv(mask)));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[31], G_SCALAR);
+	rv = call_sv(context->callback[31], G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -1239,11 +1241,13 @@ int _PLfuse_create(const char *file, mode_t mode, struct fuse_file_info *fi) {
 	/* All hashref things done */
 
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[32], G_ARRAY);
+	rv = call_sv(context->callback[32], G_ARRAY);
 	SPAGAIN;
 	if (rv) {
 		if (rv > 1) {
-			FH_STOREHANDLE(fi,POPs);
+			SV *sv = newSVsv(POPs);
+			SvSHARE(sv);
+			FH_STOREHANDLE(context,fi,sv);
 		}
 		rv = POPi;
 	}
@@ -1290,9 +1294,9 @@ int _PLfuse_ftruncate(const char *file, off_t off, struct fuse_file_info *fi) {
 	XPUSHs(sv_2mortal(newSVpv(temp, 0)));
 	free(temp);
 #endif
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[33],G_SCALAR);
+	rv = call_sv(context->callback[33],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -1312,9 +1316,9 @@ int _PLfuse_fgetattr(const char *file, struct stat *result,
 	SAVETMPS;
 	PUSHMARK(SP);
 	XPUSHs(file ? sv_2mortal(newSVpv(file,0)) : &PL_sv_undef);
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[34],G_ARRAY);
+	rv = call_sv(context->callback[34],G_ARRAY);
 	SPAGAIN;
 	if(rv != 13) {
 		if(rv > 1) {
@@ -1388,10 +1392,10 @@ int _PLfuse_lock(const char *file, struct fuse_file_info *fi, int cmd,
 		(void) hv_store(lihash, "l_pid",    5, newSViv(lockinfo->l_pid), 0);
 	}
 	XPUSHs(sv_2mortal(newRV_noinc((SV*) lihash)));
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[35],G_SCALAR);
+	rv = call_sv(context->callback[35],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	if (lockinfo && !rv) {
@@ -1425,7 +1429,7 @@ int _PLfuse_utimens(const char *file, const struct timespec tv[2]) {
 	SAVETMPS;
 	PUSHMARK(SP);
 	XPUSHs(sv_2mortal(newSVpv(file,0)));
-	if (MY_CXT.utimens_as_array) {
+	if (context->utimens_as_array) {
 		/* Pushing timespecs as 2-element arrays (if tv is present). */
 		AV *av;
 		if (tv) {
@@ -1450,7 +1454,7 @@ int _PLfuse_utimens(const char *file, const struct timespec tv[2]) {
 		XPUSHs(tv ? sv_2mortal(newSVnv(tv[1].tv_sec + (tv[1].tv_nsec / 1000000000.0))) : &PL_sv_undef);
 	}
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[36],G_SCALAR);
+	rv = call_sv(context->callback[36],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 	FREETMPS;
@@ -1482,7 +1486,7 @@ int _PLfuse_bmap(const char *file, size_t blocksize, uint64_t *idx) {
 	free(temp);
 #endif
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[37],G_ARRAY);
+	rv = call_sv(context->callback[37],G_ARRAY);
 	SPAGAIN;
 	if (rv > 0 && rv < 3) {
 		if (rv == 2)
@@ -1526,9 +1530,9 @@ int _PLfuse_ioctl(const char *file, int cmd, void *arg,
 		XPUSHs(sv_2mortal(newSVpvn(data, _IOC_SIZE(cmd))));
 	else
 		XPUSHs(&PL_sv_undef);
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[39],G_ARRAY);
+	rv = call_sv(context->callback[39],G_ARRAY);
 	SPAGAIN;
 	if ((cmd & IOC_OUT) && (rv == 2)) {
 		sv = POPs;
@@ -1585,9 +1589,9 @@ int _PLfuse_poll(const char *file, struct fuse_file_info *fi,
 	else
 		XPUSHs(&PL_sv_undef);
 	XPUSHs(sv_2mortal(newSViv(*reventsp)));
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[40],G_ARRAY);
+	rv = call_sv(context->callback[40],G_ARRAY);
 	SPAGAIN;
 	if (rv > 1) {
 		*reventsp = POPi;
@@ -1656,10 +1660,10 @@ int _PLfuse_write_buf (const char *file, struct fuse_bufvec *buf, off_t off,
 		av_push(bvlist, newRV((SV *)bvhash));
 	}
 	XPUSHs(sv_2mortal(newRV_noinc((SV *)bvlist)));
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
 
-	rv = call_sv(MY_CXT.callback[41], G_SCALAR);
+	rv = call_sv(context->callback[41], G_SCALAR);
 	SPAGAIN;
 	rv = rv ? POPi : -ENOENT;
 
@@ -1704,10 +1708,10 @@ int _PLfuse_read_buf (const char *file, struct fuse_bufvec **bufp, size_t size,
 	(void) hv_store(bvhash, "pos",   3, newSViv(0),      0);
 	av_push(bvlist, newRV((SV *)bvhash));
 	XPUSHs(sv_2mortal(newRV_noinc((SV*) bvlist)));
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	PUTBACK;
 
-	rv = call_sv(MY_CXT.callback[42], G_SCALAR);
+	rv = call_sv(context->callback[42], G_SCALAR);
 	SPAGAIN;
 	if (!rv)
 		rv = -ENOENT;
@@ -1782,7 +1786,7 @@ int _PLfuse_flock (const char *file, struct fuse_file_info *fi, int op) {
 	SAVETMPS;
 	PUSHMARK(SP);
 	XPUSHs(file ? sv_2mortal(newSVpv(file,0)) : &PL_sv_undef);
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 #ifdef PERL_HAS_64BITINT
 	XPUSHs(sv_2mortal(newSViv(fi->lock_owner)));
 #else
@@ -1793,7 +1797,7 @@ int _PLfuse_flock (const char *file, struct fuse_file_info *fi, int op) {
 	XPUSHs(sv_2mortal(newSViv(op)));
 
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[43],G_SCALAR);
+	rv = call_sv(context->callback[43],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 
@@ -1818,7 +1822,7 @@ int _PLfuse_fallocate (const char *file, int mode, off_t offset, off_t length,
 	SAVETMPS;
 	PUSHMARK(SP);
 	XPUSHs(file ? sv_2mortal(newSVpv(file,0)) : &PL_sv_undef);
-	XPUSHs(FH_GETHANDLE(fi));
+	XPUSHs(FH_GETHANDLE(context,fi));
 	XPUSHs(sv_2mortal(newSViv(mode)));
 #ifdef PERL_HAS_64BITINT
 	XPUSHs(sv_2mortal(newSViv(offset)));
@@ -1836,7 +1840,7 @@ int _PLfuse_fallocate (const char *file, int mode, off_t offset, off_t length,
 #endif
 
 	PUTBACK;
-	rv = call_sv(MY_CXT.callback[44],G_SCALAR);
+	rv = call_sv(context->callback[44],G_SCALAR);
 	SPAGAIN;
 	rv = (rv ? POPi : 0);
 
@@ -1910,6 +1914,7 @@ BOOT:
 	MY_CXT_INIT;
 #ifdef USE_ITHREADS
 	MY_CXT.self = aTHX;
+	MY_CXT.fuse_contexts = newHV();
 #endif
 
 void
@@ -1920,6 +1925,7 @@ CLONE(...)
 		dTHX;
 #endif
 	CODE:
+		PERL_UNUSED_VAR(items);
 #ifdef USE_ITHREADS
 		MY_CXT_CLONE;
 		tTHX parent = MY_CXT.self;
@@ -1928,9 +1934,9 @@ CLONE(...)
 		/* CLONE entered without a pointer table, so we can't safely clone static data */
 		if(!PL_ptr_table) {
 			for(i=0;i<N_CALLBACKS;i++) {
-				MY_CXT.callback[i] = NULL;
+				context->callback[i] = NULL;
 			}
-			MY_CXT.handles = newHV();
+			context->handles = newHV();
 		} else
 #endif
 		{
@@ -1944,29 +1950,66 @@ CLONE(...)
 			raw_param.stashes = (AV*)sv_2mortal((SV*)newAV());
 			clone_param = &raw_param;
 #endif
-			for(i=0;i<N_CALLBACKS;i++) {
-				MY_CXT.callback[i] = sv_dup(MY_CXT.callback[i], clone_param);
+			HV *new_contexts = newHV();
+
+			hv_iterinit(MY_CXT.fuse_contexts);
+			SV *contextsv;
+			char *key;
+			I32 len;
+			while ((contextsv = hv_iternextsv(MY_CXT.fuse_contexts, &key, &len)) != NULL) {
+				Fuse_Context context;
+
+				if (sv_derived_from(contextsv, "Fuse::Context")) {
+					IV tmp = SvIV((SV*)SvRV(contextsv));
+					context = INT2PTR(Fuse_Context, tmp);
+				}
+				else
+					croak("context is not of type Fuse::Context");
+
+				Fuse_Context new_context = malloc(sizeof *new_context);
+				struct fuse_operations *fops = malloc(sizeof (struct fuse_operations));
+
+				if (new_context == NULL)
+					croak("out of memory");
+				memcpy(new_context, context, sizeof *new_context);
+				memcpy(fops, context->fops, sizeof *fops);
+
+				new_context->mountpoint = strdup(context->mountpoint);
+				new_context->fops = fops;
+
+				new_context->private_data = sv_dup_inc(context->private_data, clone_param);
+				for(i=0;i<N_CALLBACKS;i++) {
+					new_context->callback[i] = sv_dup_inc(context->callback[i], clone_param);
+				}
+				new_context->handles = SvREFCNT_inc(sv_dup(context->handles, clone_param));
+				new_context->creator = my_perl;
+				hv_store(new_contexts, key, len, sv_setref_pv(newSViv(0), "Fuse::Context", new_context), 0);
 			}
-			MY_CXT.handles = (HV*)sv_dup((SV*)MY_CXT.handles, clone_param);
+
+			MY_CXT.fuse_contexts = new_contexts;
 #if (PERL_VERSION > 13) || (PERL_VERSION == 13 && PERL_SUBVERSION >= 2)
 			Perl_clone_params_del(clone_param);
 #endif
-		}
+                }
 #endif
 
 SV*
 fuse_get_context()
 	PREINIT:
+	dTHX;
+	dMY_CXT;
 	struct fuse_context *fc;
+	Fuse_Context context;
 	CODE:
 	fc = fuse_get_context();
+	context = find_fuse_context(aTHX_ aMY_CXT_ fc->private_data);
 	if(fc) {
 		HV *hash = newHV();
 		(void) hv_store(hash, "uid",   3, newSViv(fc->uid), 0);
 		(void) hv_store(hash, "gid",   3, newSViv(fc->gid), 0);
 		(void) hv_store(hash, "pid",   3, newSViv(fc->pid), 0);
-		if (fc->private_data)
-			(void) hv_store(hash, "private", 7, fc->private_data, 0);
+		if (context->private_data)
+			(void) hv_store(hash, "private", 7, context->private_data, 0);
 #if FUSE_VERSION >= 28
 		(void) hv_store(hash, "umask", 5, newSViv(fc->umask), 0);
 #endif /* FUSE_VERSION >= 28 */
@@ -2176,13 +2219,15 @@ fuse_buf_copy(...)
 #endif /* FUSE_VERSION >= 29 */
 
 void
-perl_fuse_main(...)
+perl_fuse_setup(...)
 	PREINIT:
-	struct fuse_operations fops;
+	struct fuse_operations *fops = malloc(sizeof (struct fuse_operations));
 	int i, debug;
 	char *mountpoint;
 	char *mountopts;
 	struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
+	struct fuse *fuse;
+	Fuse_Context context= malloc(sizeof *context);
 	struct fuse_chan *fc;
 	dMY_CXT;
 	INIT:
@@ -2190,130 +2235,41 @@ perl_fuse_main(...)
 		fprintf(stderr,"Perl<->C inconsistency or internal error\n");
 		XSRETURN_UNDEF;
 	}
-	memset(&fops, 0, sizeof(struct fuse_operations));
-	CODE:
+	memset(fops, 0, sizeof(struct fuse_operations));
+	memset(context, 0, sizeof *context);
+	PPCODE:
+	if (context == NULL || fops == NULL)
+		croak("out of memory");
 	debug = SvIV(ST(0));
-	MY_CXT.threaded = SvIV(ST(1));
-	MY_CXT.handles = (HV*)(sv_2mortal((SV*)(newHV())));
-	if(MY_CXT.threaded) {
+	context->threaded = SvIV(ST(1));
+	context->handles = (HV*)(sv_2mortal((SV*)(newHV())));
+        SvREFCNT_inc(context->handles);
+        context->creator = my_perl;
+	if(context->threaded) {
 #ifdef FUSE_USE_ITHREADS
-		master_interp = aTHX;
-		MUTEX_INIT(&MY_CXT.mutex);
-		SvSHARE((SV*)(MY_CXT.handles));
+		SvSHARE((SV*)(context->handles));
 #else
 		fprintf(stderr,"FUSE warning: Your script has requested multithreaded "
 		               "mode, but your perl was not built with a supported "
 		               "thread model. Threads are disabled.\n");
-		MY_CXT.threaded = 0;
+		context->threaded = 0;
 #endif
 	}
 	mountpoint = SvPV_nolen(ST(2));
 	mountopts = SvPV_nolen(ST(3));
 #if FUSE_VERSION >= 28
-	fops.flag_nullpath_ok = SvIV(ST(4));
+	fops->flag_nullpath_ok = SvIV(ST(4));
 #endif /* FUSE_VERSION >= 28 */
-	MY_CXT.utimens_as_array = SvIV(ST(5));
+	context->utimens_as_array = SvIV(ST(5));
 #if FUSE_VERSION >= 29
-	fops.flag_nopath = SvIV(ST(6));
-	fops.flag_utime_omit_ok = SvIV(ST(7));
+	fops->flag_nopath = SvIV(ST(6));
+	fops->flag_utime_omit_ok = SvIV(ST(7));
 #endif /* FUSE_VERSION >= 29 */
 	for(i=0;i<N_CALLBACKS;i++) {
 		SV *var = ST(i+N_FLAGS);
 		/* allow symbolic references, or real code references. */
 		if(SvOK(var) && (SvPOK(var) || (SvROK(var) && SvTYPE(SvRV(var)) == SVt_PVCV))) {
-			void **tmp1 = (void**)&_available_ops, **tmp2 = (void**)&fops;
-			/* Dirty hack, to keep anything from overwriting the
-			 * flag area with a pointer. There should never be
-			 * anything passed as 'junk', but this prevents
-			 * someone from doing it and screwing things up... */
-			if (i == 38)
-				continue;
-			tmp2[i] = tmp1[i];
-			MY_CXT.callback[i] = var;
-		} else if(SvOK(var)) {
-			croak("invalid callback (%i) passed to perl_fuse_main "
-			      "(%s is not a string, code ref, or undef).\n",
-			      i+N_FLAGS,SvPVbyte_nolen(var));
-		} else {
-			MY_CXT.callback[i] = NULL;
-		}
-	}
-	/*
-	 * XXX: What comes here is just a ridiculous use of the option parsing API
-	 * to hack on compatibility with other parts of the new API. First and
-	 * foremost, real C argc/argv would be good to get at...
-	 */
-	if ((mountopts || debug) && fuse_opt_add_arg(&args, "") == -1) {
-		fuse_opt_free_args(&args);
-		croak("out of memory\n");
-	}
-	if (mountopts && strcmp("", mountopts) &&
-	     (fuse_opt_add_arg(&args, "-o") == -1 ||
-	     fuse_opt_add_arg(&args, mountopts) == -1)) {
-		fuse_opt_free_args(&args);
-		croak("out of memory\n");
-	}
-	if (debug && fuse_opt_add_arg(&args, "-d") == -1) {
-		fuse_opt_free_args(&args);
-		croak("out of memory\n");
-	}
-	fc = fuse_mount(mountpoint,&args);
-	if (fc == NULL)
-		croak("could not mount fuse filesystem!\n");
-#if !defined(USING_LIBREFUSE) && !defined(__OpenBSD__)
-	if(MY_CXT.threaded) {
-		fuse_loop_mt(fuse_new(fc,&args,&fops,sizeof(fops),NULL));
-	} else
-#endif /* !defined(USING_LIBREFUSE) && !defined(__OpenBSD__) */
-		fuse_loop(fuse_new(fc,&args,&fops,sizeof(fops),NULL));
-	fuse_unmount(mountpoint,fc);
-	fuse_opt_free_args(&args);
-
-void
-perl_fuse_setup(...)
-	PREINIT:
-	struct fuse_operations fops;
-	int i, debug;
-	char *mountpoint;
-	char *mountopts;
-	struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
-	struct fuse *fuse;
-	struct fusedata *fusedata= malloc(sizeof (struct fusedata));
-	struct fuse_chan *fc;
-	dMY_CXT;
-	INIT:
-	if(items != N_CALLBACKS + 6) {
-		fprintf(stderr,"Perl<->C inconsistency or internal error\n");
-		XSRETURN_UNDEF;
-	}
-	memset(&fops, 0, sizeof(struct fuse_operations));
-	PPCODE:
-	debug = SvIV(ST(0));
-	MY_CXT.threaded = SvIV(ST(1));
-	MY_CXT.handles = (HV*)(sv_2mortal((SV*)(newHV())));
-	if(MY_CXT.threaded) {
-#ifdef FUSE_USE_ITHREADS
-		master_interp = aTHX;
-		MUTEX_INIT(&MY_CXT.mutex);
-		SvSHARE((SV*)(MY_CXT.handles));
-#else
-		fprintf(stderr,"FUSE warning: Your script has requested multithreaded "
-		               "mode, but your perl was not built with a supported "
-		               "thread model. Threads are disabled.\n");
-		MY_CXT.threaded = 0;
-#endif
-	}
-	mountpoint = SvPV_nolen(ST(2));
-	mountopts = SvPV_nolen(ST(3));
-#if FUSE_VERSION >= 28
-	fops.flag_nullpath_ok = SvIV(ST(4));
-#endif /* FUSE_VERSION >= 28 */
-	MY_CXT.utimens_as_array = SvIV(ST(5));
-	for(i=0;i<N_CALLBACKS;i++) {
-		SV *var = ST(i+6);
-		/* allow symbolic references, or real code references. */
-		if(SvOK(var) && (SvPOK(var) || (SvROK(var) && SvTYPE(SvRV(var)) == SVt_PVCV))) {
-			void **tmp1 = (void**)&_available_ops, **tmp2 = (void**)&fops;
+			void **tmp1 = (void**)&_available_ops, **tmp2 = (void**)fops;
 			/* Dirty hack, to keep anything from overwriting the
 			 * flag area with a pointer. There should never be
 			 * anything passed as 'junk', but this prevents
@@ -2322,13 +2278,13 @@ perl_fuse_setup(...)
 				continue;
 			tmp2[i] = tmp1[i];
 			/* it is important to protect these values until shutdown */
-			MY_CXT.callback[i] = SvREFCNT_inc(var);
+			context->callback[i] = SvREFCNT_inc(var);
 		} else if(SvOK(var)) {
-			croak("invalid callback (%i) passed to perl_fuse_main "
+			croak("invalid callback (%i) passed to perl_fuse_setup "
 			      "(%s is not a string, code ref, or undef).\n",
-			      i+6,SvPVbyte_nolen(var));
+			      i+N_FLAGS,SvPVbyte_nolen(var));
 		} else {
-			MY_CXT.callback[i] = NULL;
+			context->callback[i] = NULL;
 		}
 	}
 	/*
@@ -2353,53 +2309,82 @@ perl_fuse_setup(...)
 	fc = fuse_mount(mountpoint,&args);
 	if (fc == NULL)
 		croak("could not mount fuse filesystem!\n");
-	fuse = fuse_new(fc,&args,&fops,sizeof(fops),NULL);
+	context->mountpoint = strdup(mountpoint);
+	fuse = fuse_new(fc,&args,fops,sizeof(*fops),context->mountpoint);
 	fuse_opt_free_args(&args);
-//	fusedata = malloc(sizeof (struct fusedata));
-	fusedata->fuse = fuse;
-	fusedata->se = fuse_get_session(fuse);
-	fusedata->ch = fuse_session_next_chan(fusedata->se, NULL);
-	fusedata->bufsize = fuse_chan_bufsize(fusedata->ch);
-	fusedata->buf = malloc(fusedata->bufsize);
-	if(!fusedata->buf)
-		croak("not enough mem");
-	fusedata->mountpoint = strdup(mountpoint);
-//	fprintf(stderr, "fusedata %x perl_fuse_process %x\n", fusedata, &XS_Fuse_perl_fuse_process);
-//	sleep (30);
-	XPUSHs(sv_setref_pv(sv_newmortal(), "Fusedata", fusedata));
+	context->fuse = fuse;
+	context->fops = fops;
+	context->se = fuse_get_session(fuse);
+	context->ch = fuse_session_next_chan(context->se, NULL);
+	context->bufsize = fuse_chan_bufsize(context->ch);
+	hv_store(MY_CXT.fuse_contexts, mountpoint, strlen(mountpoint),
+		 sv_setref_pv(newSViv(0), "Fuse::Context", context), 0);
+	XPUSHs(newSVpv(mountpoint, strlen(mountpoint)));
 	XPUSHs(sv_2mortal(newSViv(fuse_chan_fd(fc))));
 
-void
-perl_fuse_process(Fusedata fusedata)
+int
+perl_fuse_session_exited(const char *mountpoint)
 CODE:
-	int res;
-//	fprintf(stderr, "fusedata %x ch %x se %x buf %x\n", fusedata, fusedata->ch, fusedata->se, fusedata->buf);
-	while (!fuse_session_exited(fusedata->se)) {
-	    struct fuse_chan *tmpch = fusedata->ch;
-	    res = fuse_chan_recv(&tmpch, fusedata->buf, fusedata->bufsize);
-	    if (res == -EINTR)
-		continue;
-	    if (res <= 0)
-		break;
-	    fuse_session_process(fusedata->se, fusedata->buf, res, tmpch);
-	    break;
-	}
+	dMY_CXT;
+	Fuse_Context context = find_fuse_context(aTHX_ aMY_CXT_ mountpoint);
+	if (!context)
+		croak("no such session");
+	RETVAL = fuse_session_exited(context->se);
+OUTPUT:
+	RETVAL
+
+int
+perl_fuse_process_buf(const char *mountpoint, SV *sv, Fuse_Channel tmpch)
+CODE:
+	dMY_CXT;
+	Fuse_Context context = find_fuse_context(aTHX_ aMY_CXT_ mountpoint);
+	STRLEN len;
+	void *mem = SvPV(sv, len);
+
+	if (!context)
+		croak("no such session");
+
+	fuse_session_process(context->se, mem, len, tmpch);
+
+	RETVAL = 0;
+OUTPUT:
+	RETVAL
 
 void
-perl_fuse_shutdown(Fusedata fusedata)
-PREINIT:
-	int i;
+perl_fuse_receive_buf(const char *mountpoint)
+PPCODE:
 	dMY_CXT;
-CODE:
-	for(i = 0 ; i < N_CALLBACKS ; i++) {
-	    SV *var = MY_CXT.callback[i];
-	    if(var)
-		SvREFCNT_dec(var);
+	Fuse_Context context = find_fuse_context(aTHX_ aMY_CXT_ mountpoint);
+	int res;
+	void *buf = malloc(context->bufsize);
+	struct fuse_chan *tmpch = context->ch;
+	SV *ret;
+	if (buf == NULL) {
+		XSRETURN_UNDEF;
 	}
-	free(fusedata->buf);
-	fuse_unmount(fusedata->mountpoint, fusedata->fuse);
-	fuse_destroy(fusedata->fuse);
-	free(fusedata);
+
+	do {
+		res = fuse_chan_recv(&tmpch, buf, context->bufsize);
+	} while (res == -EINTR);
+
+	if (res <= 0) {
+		free(buf);
+		XSRETURN_UNDEF;
+	}
+
+	ret = newSVpv(buf, res);
+	free(buf);
+	XPUSHs(sv_2mortal(ret));
+	XPUSHs(sv_setref_pv(sv_newmortal(), "Fuse::Channel", tmpch));
+
+void
+perl_fuse_shutdown(const char *mountpoint)
+CODE:
+	dMY_CXT;
+	Fuse_Context context = find_fuse_context(aTHX_ aMY_CXT_ mountpoint);
+	fuse_unmount(context->mountpoint, context->ch);
+	fuse_destroy(context->fuse);
+        hv_delete(MY_CXT.fuse_contexts, context->mountpoint, strlen(context->mountpoint), 0);
 
 #if FUSE_VERSION >= 28
 
@@ -2409,8 +2394,8 @@ pollhandle_destroy(...)
 	struct fuse_pollhandle *ph;
     INIT:
 	if (items != 1) {
-	    fprintf(stderr, "No pollhandle passed?\n");
-	    XSRETURN_UNDEF;
+		fprintf(stderr, "No pollhandle passed?\n");
+		XSRETURN_UNDEF;
 	}
     CODE:
 	ph = INT2PTR(struct fuse_pollhandle*, SvIV(ST(0)));
@@ -2422,8 +2407,8 @@ notify_poll(...)
 	struct fuse_pollhandle *ph;
     INIT:
 	if (items != 1) {
-	    fprintf(stderr, "No pollhandle passed?\n");
-	    XSRETURN_UNDEF;
+		fprintf(stderr, "No pollhandle passed?\n");
+		XSRETURN_UNDEF;
 	}
     CODE:
 	ph = INT2PTR(struct fuse_pollhandle*, SvIV(ST(0)));
@@ -2432,3 +2417,25 @@ notify_poll(...)
 	RETVAL
 
 #endif
+
+MODULE = Fuse		PACKAGE = Fuse::Context	PREFIX = perl_fuse_context_
+void
+perl_fuse_context_DESTROY(Fuse_Context context)
+PREINIT:
+	int i;
+	dTHX;
+CODE:
+        if (aTHX != context->creator)
+		return;
+
+	for(i = 0 ; i < N_CALLBACKS ; i++) {
+	    SV *var = context->callback[i];
+	    if(var)
+		SvREFCNT_dec(var);
+	}
+	SvREFCNT_dec((SV *)context->handles);
+	SvREFCNT_dec(context->private_data);
+	free(context->fops);
+	free(context->mountpoint);
+	free(context);
+
